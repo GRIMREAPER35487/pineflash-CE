@@ -1,7 +1,7 @@
 [Desktop Entry]
-Name=PineFlash
-GenericName=PineFlash
-Comment=Tool to flash pine64 devices
+Name=PineFlash CE
+GenericName=IronOS flasher
+Comment=Flash IronOS to Pinecil soldering irons
 Exec=pineflash
 Icon=pine64logo
 Terminal=false

@@ -1,8 +1,11 @@
 [package]
 name = "pineflash"
-version = "0.5.5"
+version = "0.6.0-beta.1"
 edition = "2021"
 build = "build.rs"
+description = "PineFlash CE: a community continuation of PineFlash, the IronOS flasher for Pinecil V1 and V2"
+repository = "https://github.com/GRIMREAPER35487/pineflash"
+license = "GPL-2.0-only"
 [[bin]]
 name = "pineflash"
 path = "src/main.rs"
@@ -13,7 +16,6 @@ path = "src/main.rs"
 egui_file = "0.17.0"
 zip-extract = "0.1.1"
 eframe = "0.27.2"
-egui-notify = "0.14.0"
 egui_extras = { version = "0.27.2", features = ["all_loaders"] }
 rfd = "0.11.3"
 whoami = "1.2.3"

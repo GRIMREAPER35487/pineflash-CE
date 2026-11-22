@@ -1,0 +1,9 @@
+bl70x_eflash_loader.bin
+
+Bouffalo Lab BL70x eflash_loader (32 MHz), Copyright Bouffalo Lab, Apache License 2.0.
+Taken byte-for-byte from pine64/blisp (data/bl70x_eflash_loader.h, MIT-licensed project),
+which states it was extracted from BLDevCube 1.8.0 eflash_loader_32m.bin.
+Identical to the copy embedded in the official blisp v0.0.4 and v0.0.5 Windows builds.
+
+PineFlash loads this small program into the Pinecil V2's RAM to erase/write/read its flash.
+It is never written to the iron's flash.

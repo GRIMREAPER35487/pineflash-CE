@@ -9,20 +9,18 @@ use std::{
 };
 
 use curl::easy::Easy;
-use eframe::{egui::{self, ImageSource}, epaint::ColorImage};
+use eframe::egui;
 use eframe::{
-    emath,
     epaint::{Color32, Rounding, Stroke},
     CreationContext,
 };
 mod submodules;
 use egui::Context;
 use egui_file::FileDialog;
-use egui_notify::{Anchor, Toasts};
+use submodules::notify::Toasts;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-const ICON: &[u8] = include_bytes!("../assets/pine64logo.ico");
 
 #[derive(Serialize, Deserialize)]
 struct Language {
@@ -43,7 +41,10 @@ struct FlasherConfig {
     code_names: Vec<String>,
     lang: String,
     versions_checked: bool,
-    vers: Vec<String>, download_metadata: bool,
+    vers: Vec<String>,
+    /// Which entries of `vers` are pre-releases.
+    prereleases: Vec<String>,
+    download_metadata: bool,
     blisp_version: String,
     run_once_vers: bool,
     download: bool,
@@ -54,7 +55,7 @@ struct FlasherConfig {
     logs: String,
     json: String,
     iron_connected: Option<String>,
-    check_count: i32,
+    last_poll: std::time::Instant,
     flash: bool,
     flash_notified_count: i32,
     v2_serial_path: Option<String>,
@@ -63,16 +64,82 @@ struct FlasherConfig {
     json_checked: bool,
     metadata_path: PathBuf,
     open_file_dialog: Option<FileDialog>,
+    // Built-in Pinecil V2 flasher (runs on a background thread)
+    flash_events: Option<std::sync::mpsc::Receiver<submodules::bl70x::FlashEvent>>,
+    flash_stage: String,
+    flash_progress: f32,
+    restore_dialog: Option<FileDialog>,
+    last_iron: String,
+    last_version: String,
+    /// None = automatic (shown while no iron is connected)
+    show_guide: Option<bool>,
+    backup_count: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)] // settings files from older versions are missing newer fields
 struct FlashSavedConfig {
     pub dark_mode: bool,
+    /// List IronOS pre-releases (release candidates) newer than the latest stable release.
+    pub show_prereleases: bool,
 }
 
 impl Default for FlashSavedConfig {
     fn default() -> Self {
-        Self { dark_mode: true }
+        Self { dark_mode: true, show_prereleases: false }
+    }
+}
+
+/// From GitHub's release list (newest first): the three newest stable releases, plus, if asked,
+/// any pre-releases newer than the newest stable one. Returns (versions, the pre-release ones).
+fn parse_versions(json: &str, include_prereleases: bool) -> (Vec<String>, Vec<String>) {
+    let releases = serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|j| j.as_array().cloned())
+        .unwrap_or_default();
+    let mut versions = Vec::new();
+    let mut pre = Vec::new();
+    let mut stable = 0;
+    for r in releases.iter().filter(|r| !r["draft"].as_bool().unwrap_or(false)) {
+        let Some(tag) = r["tag_name"].as_str() else { continue };
+        if r["prerelease"].as_bool().unwrap_or(false) {
+            if include_prereleases && stable == 0 {
+                versions.push(tag.to_string());
+                pre.push(tag.to_string());
+            }
+        } else {
+            versions.push(tag.to_string());
+            stable += 1;
+            if stable == 3 {
+                break;
+            }
+        }
+    }
+    (versions, pre)
+}
+
+impl Flasher {
+    pub fn save_settings(&mut self) {
+        if confy::store("PineFlash", None, self.saved_config.clone()).is_err() {
+            self.config.logs.push_str("PineFlash: Failed to save the app state.\n");
+        }
+    }
+
+    /// Re-read the cached release list, e.g. after the pre-release switch changes.
+    pub fn refresh_versions(&mut self) {
+        let json = std::fs::read_to_string(&self.config.metadata_path).unwrap_or_default();
+        let (versions, pre) = parse_versions(&json, self.saved_config.show_prereleases);
+        if versions.is_empty() {
+            return;
+        }
+        if self.config.version != "Select"
+            && self.config.version != "Custom"
+            && !versions.contains(&self.config.version)
+        {
+            self.config.version = "Select".to_string();
+        }
+        self.config.vers = versions;
+        self.config.prereleases = pre;
     }
 }
 
@@ -93,6 +160,7 @@ impl Default for FlasherConfig {
             lang: "EN".to_string(),
             versions_checked: false,
             vers: vec![],
+            prereleases: vec![],
             download_metadata: false,
             run_once_vers: true,
             json_checked: false,
@@ -103,17 +171,17 @@ impl Default for FlasherConfig {
             picked_path: None,
             ready_to_flash: false,
             #[cfg(feature = "appimage")]
-            logs: format!("Pineflash v{} Linux Appimage\n", env!("CARGO_PKG_VERSION")),
+            logs: format!("PineFlash CE v{} Linux Appimage\n", env!("CARGO_PKG_VERSION")),
             #[cfg(not(feature = "appimage"))]
             #[cfg(target_os = "linux")]
-            logs: format!("Pineflash v{} Linux Native\n", env!("CARGO_PKG_VERSION")),
+            logs: format!("PineFlash CE v{} Linux Native\n", env!("CARGO_PKG_VERSION")),
             #[cfg(target_os = "windows")]
-            logs: format!("Pineflash v{} Windows\n", env!("CARGO_PKG_VERSION")),
+            logs: format!("PineFlash CE v{} Windows\n", env!("CARGO_PKG_VERSION")),
             #[cfg(target_os = "macos")]
-            logs: format!("Pineflash v{} MacOs\n", env!("CARGO_PKG_VERSION")),
+            logs: format!("PineFlash CE v{} MacOs\n", env!("CARGO_PKG_VERSION")),
             json: "".to_string(),
             iron_connected: None,
-            check_count: 0,
+            last_poll: std::time::Instant::now(),
             flash: false,
             flash_notified_count: 0,
             v2_serial_path: None,
@@ -131,6 +199,14 @@ impl Default for FlasherConfig {
                 .iter()
                 .collect(),
             open_file_dialog: None,
+            flash_events: None,
+            flash_stage: String::new(),
+            flash_progress: 0.0,
+            restore_dialog: None,
+            last_iron: "Pinecil V2".to_string(),
+            last_version: "Select".to_string(),
+            show_guide: None,
+            backup_count: submodules::main_panel::count_backups(),
         }
     }
 }
@@ -140,73 +216,11 @@ impl Flasher {
         let config: FlasherConfig = FlasherConfig::default();
         // Flasher::configure_fonts(&cc.egui_ctx);
         let saved_config: FlashSavedConfig = confy::load("PineFlash", None).unwrap_or_default();
-        let toasts = Toasts::default()
-            .with_anchor(Anchor::TopRight)
-            .with_margin(emath::vec2(0.0, 120.0));
+        let toasts = Toasts::default();
 
-        let mut style: egui::Style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(5.0, 10.0);
-
-        cc.egui_ctx.set_style(style);
-        let new_style = egui::style::WidgetVisuals {
-            bg_fill: Color32::from_rgb(17, 17, 17),
-            weak_bg_fill: Color32::from_rgb(17, 17, 17),
-
-            rounding: Rounding {
-                nw: 4.,
-                ne: 4.,
-                sw: 4.,
-                se: 4.,
-            },
-
-            bg_stroke: Stroke {
-                width: 1.,
-                color: Color32::from_rgb(140, 140, 140),
-            },
-            fg_stroke: Stroke {
-                width: 1.,
-                color: Color32::from_rgb(140, 140, 140),
-            },
-
-            expansion: 2.,
-        };
-        let new_hovered_style = egui::style::WidgetVisuals {
-            bg_fill: Color32::from_rgb(17, 17, 17),
-            weak_bg_fill: Color32::from_rgb(17, 17, 17),
-
-            rounding: Rounding {
-                nw: 4.,
-                ne: 4.,
-                sw: 4.,
-                se: 4.,
-            },
-
-            bg_stroke: Stroke {
-                width: 1.5,
-                color: egui::Color32::from_rgb(56, 55, 55),
-            },
-            fg_stroke: Stroke {
-                width: 1.,
-                color: Color32::from_rgb(140, 140, 140),
-            },
-
-            expansion: 2.,
-        };
-        cc.egui_ctx.set_visuals(egui::style::Visuals {
-            widgets: egui::style::Widgets {
-                active: new_style,
-                inactive: new_style,
-                hovered: new_hovered_style,
-                noninteractive: new_style,
-                open: new_hovered_style,
-            },
-            ..Default::default()
-        });
-
-        if !saved_config.dark_mode {
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
-        }
-
+        apply_theme(&cc.egui_ctx, saved_config.dark_mode);
+        // Follow the OS display scaling, just a little larger than egui's default.
+        cc.egui_ctx.set_zoom_factor(1.15);
         Flasher::configure_fonts(cc.egui_ctx.clone());
         Flasher {
             config,
@@ -218,102 +232,85 @@ impl Flasher {
 
 impl eframe::App for Flasher {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // always repaint to have accurate pinecil detection
-        ctx.request_repaint();
-        ctx.set_pixels_per_point(1.8);
+        // Wake up regularly to poll USB and background work, without spinning the CPU.
+        ctx.request_repaint_after(Duration::from_millis(100));
 
-        if self.config.check_count < 180 {
-            self.config.check_count += 1
-        } else {
+        self.poll_native_flash();
+
+        if self.config.last_poll.elapsed() >= Duration::from_millis(1500)
+            && self.config.flash_events.is_none()
+        {
+            // Don't poll USB while flashing: the iron re-enumerates mid-flash.
+            self.config.last_poll = std::time::Instant::now();
             self.config.iron_connected = Flasher::check_connections(self);
-            self.config.check_count = 0
+            self.config.backup_count = submodules::main_panel::count_backups();
         }
 
         if self.config.download_versions {
             let _ = std::fs::remove_file(self.config.metadata_path.clone());
             self.config.download_versions = !self.config.download_versions;
             self.toasts
-                .info("Fetching versions")
+                .info("Checking for firmware releases")
                 .set_duration(None)
                 .set_closable(false);
 
             std::thread::spawn(|| {
-                let mut data = Vec::new();
-                let mut handle = Easy::new();
-                let mut internet = true;
-                handle
-                    .url("https://api.github.com/repos/Ralim/IronOS/releases")
-                    .unwrap();
-                handle.useragent("PineFlash").unwrap();
-                {
-                    let mut transfer = handle.transfer();
-                    transfer
-                        .write_function(|new_data| {
-                            data.extend_from_slice(new_data);
-                            Ok(new_data.len())
-                        })
-                        .unwrap();
-                    if transfer.perform().is_err() {
-                        internet = false;
-                    }
-                }
-                let path: PathBuf = [std::env::temp_dir(), "metadata.json".into()]
-                    .iter()
-                    .collect();
-
-                if internet {
-                    let json = String::from_utf8(data).unwrap();
-                    std::fs::write(path, json).unwrap();
-                } else {
-                    std::fs::write(path, "No Internet").unwrap();
+                let path: PathBuf = std::env::temp_dir().join("metadata.json");
+                let body = match download("https://api.github.com/repos/Ralim/IronOS/releases") {
+                    Ok(data) => String::from_utf8_lossy(&data).into_owned(),
+                    Err(DownloadError::Network(_)) => "No Internet".to_string(),
+                    // e.g. GitHub rate limit (403): keep the message so the UI can show it
+                    Err(e) => format!("{{\"error\": {:?}}}", e.to_string()),
+                };
+                // Write then rename, so the UI thread never reads a half-written file.
+                let tmp = path.with_extension("json.part");
+                if std::fs::write(&tmp, body).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
                 }
             });
-        } else if self.config.metadata_path.exists()
-            && !self.config.versions_checked
-            && !String::from_utf8(std::fs::read(self.config.metadata_path.clone()).unwrap())
-                .unwrap()
+        } else if !self.config.versions_checked
+            && self.config.metadata_path.exists()
+            && !std::fs::read_to_string(&self.config.metadata_path)
+                .unwrap_or_default()
                 .contains("No Internet")
         {
             self.toasts.dismiss_all_toasts();
             self.toasts
-                .info("Versions Found")
+                .success("Firmware list updated")
                 .set_duration(Some(Duration::from_secs(5)))
                 .set_closable(false);
             self.config
                 .logs
                 .push_str("PineFlash: Versions successfully fetched.\n");
             self.config.json_checked = !self.config.json_checked;
-            let string =
-                String::from_utf8(std::fs::read(self.config.metadata_path.clone()).unwrap())
-                    .unwrap();
-            let json: Result<Value, serde_json::Error> = serde_json::from_str(string.as_str());
-            if json.is_err() {
+            let string = std::fs::read_to_string(&self.config.metadata_path).unwrap_or_default();
+            let (versions, pre) = parse_versions(&string, self.saved_config.show_prereleases);
+            if versions.is_empty() {
                 self.toasts.dismiss_all_toasts();
                 self.toasts
-                    .error("Could not access github, Online Files Will be Unavailable")
+                    .error("Could not reach GitHub\nOnline firmware is unavailable. You can still flash a file from this PC.")
                     .set_duration(Some(Duration::from_secs(5)))
                     .set_closable(false);
-                self.config
-                    .logs
-                    .push_str("PineFlash: Invalid json downloaded, could not fetch versions.\n");
+                let detail: String = string.chars().take(200).collect();
+                self.config.logs.push_str(
+                    format!("PineFlash: Could not read the release list from GitHub: {}\n", detail).as_str(),
+                );
                 self.config.versions_checked = true;
             } else {
-                for i in 0..3 {
-                    let version = json.as_ref().unwrap()[i]["tag_name"].as_str().unwrap();
-                    self.config.vers.push(version.to_string());
-                }
+                self.config.vers = versions;
+                self.config.prereleases = pre;
                 self.config.versions_checked = true;
                 self.config.download_metadata = true;
             }
         } else if !self.config.versions_checked
             && self.config.metadata_path.exists()
-            && String::from_utf8(std::fs::read(self.config.metadata_path.clone()).unwrap())
-                .unwrap()
+            && std::fs::read_to_string(&self.config.metadata_path)
+                .unwrap_or_default()
                 .contains("No Internet")
         {
             self.toasts.dismiss_all_toasts();
             self.toasts
-                .error("No Internet, Online Files Will be Unavailable")
+                .error("No internet connection\nOnline firmware is unavailable. You can still flash a file from this PC.")
                 .set_duration(Some(Duration::from_secs(5)))
                 .set_closable(false);
             self.config
@@ -338,7 +335,7 @@ impl eframe::App for Flasher {
             if self.config.download_firm_notify {
                 let _ = std::fs::write(pathlock, "Locked");
                 self.toasts
-                    .info("Downloading")
+                    .info("Downloading firmware")
                     .set_duration(None)
                     .set_closable(false);
                 self.config.logs.push_str(
@@ -352,54 +349,40 @@ impl eframe::App for Flasher {
                 let version = self.config.version.clone();
                 let int_name = self.config.int_name.clone();
                 std::thread::spawn(move || {
-                    let mut data = Vec::new();
-                    let mut handle = Easy::new();
-                    let path: PathBuf = [
-                        std::env::temp_dir(),
-                        format!("{}-{}.zip", version, int_name).into(),
-                    ]
-                    .iter()
-                    .collect();
-                    let pathlock: PathBuf = [std::env::temp_dir(), "firmware.lock".into()]
-                        .iter()
-                        .collect();
-                    let _ = handle.url(
-                        format!(
-                            "https://github.com/Ralim/IronOS/releases/download/{}/{}.zip",
-                            version, int_name
-                        )
-                        .as_str(),
+                    let path: PathBuf =
+                        std::env::temp_dir().join(format!("{}-{}.zip", version, int_name));
+                    let pathlock: PathBuf = std::env::temp_dir().join("firmware.lock");
+                    let url = format!(
+                        "https://github.com/Ralim/IronOS/releases/download/{}/{}.zip",
+                        version, int_name
                     );
-                    let _ = handle.follow_location(true);
-                    handle.useragent("PineFlash").unwrap();
-                    {
-                        let mut transfer = handle.transfer();
-                        transfer
-                            .write_function(|new_data| {
-                                data.extend_from_slice(new_data);
-                                Ok(new_data.len())
-                            })
-                            .unwrap();
-                        transfer.perform().unwrap()
+                    if let Ok(zip) = download(&url) {
+                        let _ = std::fs::write(path, zip);
                     }
-                    let zip = data.as_slice();
-                    if std::fs::write(path, zip).is_err() {
-                        println!("Could not write zip file")
-                    };
-                    if std::fs::remove_file(pathlock).is_err() {
-                        println!("Could not remove lockfile")
-                    };
+                    // Always release the lock, even on failure, so the UI can't hang.
+                    let _ = std::fs::remove_file(pathlock);
                 });
                 self.config.download_firm_notify = false
             } else if !self.config.download_firm_notify && !pathlock.exists() {
                 self.toasts.dismiss_all_toasts();
-                self.config.logs.push_str("PineFlash: Download Complete.\n");
-                self.toasts
-                    .info("Flashing.")
-                    .set_duration(None)
-                    .set_closable(false);
                 self.config.download = false;
-                self.config.flash = true;
+                if path.exists() {
+                    self.config.logs.push_str("PineFlash: Download Complete.\n");
+                    self.toasts
+                        .info("Flashing")
+                        .set_duration(None)
+                        .set_closable(false);
+                    self.config.flash = true;
+                } else {
+                    self.config
+                        .logs
+                        .push_str("PineFlash: Firmware download failed (network error or file not on GitHub).\n");
+                    self.toasts
+                        .error("Firmware download failed\nCheck your internet connection and try again.")
+                        .set_duration(Some(Duration::from_secs(6)))
+                        .set_closable(true);
+                    self.config.download_firm_notify = true;
+                }
             }
         }
         if !self.config.version.contains("Select")
@@ -410,85 +393,51 @@ impl eframe::App for Flasher {
             let pathlock: PathBuf = [std::env::temp_dir(), "langs.lock".into()].iter().collect();
             if self.config.run_once_vers {
                 self.toasts
-                    .info("Downloading Language information.")
+                    .info("Downloading language list")
                     .set_duration(None)
                     .set_closable(false);
                 let _ = std::fs::remove_file(path);
                 let _ = std::fs::write(pathlock, "Locked");
                 let version = self.config.version.clone();
                 std::thread::spawn(move || {
-                    let mut data = Vec::new();
-                    let mut handle = Easy::new();
-                    let path: PathBuf = [std::env::temp_dir(), "langs.zip".into()].iter().collect();
-                    let pathlock: PathBuf =
-                        [std::env::temp_dir(), "langs.lock".into()].iter().collect();
-                    let _ = std::fs::remove_file(path.clone());
-
-                    let _ = handle.follow_location(true);
-                    handle
-                        .url(
-                            format!(
-                                "https://github.com/Ralim/IronOS/releases/download/{}/metadata.zip",
-                                version
-                            )
-                            .as_str(),
-                        )
-                        .unwrap();
-                    handle.useragent("PineFlash").unwrap();
-                    {
-                        let mut transfer = handle.transfer();
-                        transfer
-                            .write_function(|new_data| {
-                                data.extend_from_slice(new_data);
-                                Ok(new_data.len())
-                            })
-                            .unwrap();
-                        transfer.perform().unwrap();
+                    let path: PathBuf = std::env::temp_dir().join("langs.zip");
+                    let pathlock: PathBuf = std::env::temp_dir().join("langs.lock");
+                    let _ = std::fs::remove_file(&path);
+                    let url = format!(
+                        "https://github.com/Ralim/IronOS/releases/download/{}/metadata.zip",
+                        version
+                    );
+                    if let Ok(zip) = download(&url) {
+                        let _ = std::fs::write(path, zip);
                     }
-                    let zip = data.as_slice();
-                    if std::fs::write(path, zip).is_err() {
-                        println!("Could not write zip file")
-                    };
-                    if std::fs::remove_file(pathlock).is_err() {
-                        println!("Could not remove lockfile")
-                    };
+                    let _ = std::fs::remove_file(pathlock);
                 });
                 self.config.run_once_vers = false;
             } else if !pathlock.exists() {
-                let path: PathBuf = [std::env::temp_dir(), "langs.zip".into()].iter().collect();
                 self.toasts.dismiss_all_toasts();
-                self.config
-                    .logs
-                    .push_str("PineFlash: Download of Language Info Complete.\n");
-                self.toasts
-                    .info("Languages Downloaded.")
-                    .set_duration(Some(Duration::from_secs(3)))
-                    .set_closable(false);
-                let mut file = File::open(path).unwrap();
-                let mut data = Vec::new();
-                file.read_to_end(&mut data).unwrap();
-                let target_dir: PathBuf =
-                    [std::env::temp_dir(), "metadata".into()].iter().collect();
-                zip_extract::extract(Cursor::new(data), &target_dir, false).unwrap();
-                let json_path: PathBuf = [
-                    std::env::temp_dir(),
-                    "metadata".into(),
-                    format!("{}.json", self.config.int_name).into(),
-                ]
-                .iter()
-                .collect();
-                self.config.json = fs::read_to_string(json_path).unwrap();
                 self.config.download_metadata = false;
-
-                let value: YourValue = serde_json::from_str(self.config.json.as_str()).unwrap();
-                for i in value.contents {
-                    if !i.0.contains(".hex") {
-                        let a = i.1;
-                        self.config.fancy_names.push(a.language_name);
-                        self.config.code_names.push(a.language_code);
+                match self.load_languages(&path) {
+                    Ok(count) => {
+                        self.config.logs.push_str(
+                            format!("PineFlash: Download of Language Info Complete ({} languages).\n", count)
+                                .as_str(),
+                        );
+                        self.toasts
+                            .success("Languages ready")
+                            .set_duration(Some(Duration::from_secs(3)))
+                            .set_closable(false);
+                    }
+                    Err(e) => {
+                        self.config
+                            .logs
+                            .push_str(format!("PineFlash: Could not load languages: {}\n", e).as_str());
+                        self.toasts
+                            .error("Could not download the language list\nEnglish (EN) will be used.")
+                            .set_duration(Some(Duration::from_secs(5)))
+                            .set_closable(true);
+                        self.config.lang = "EN".to_string();
                     }
                 }
-                self.config.download_metadata = false;
             }
         }
 
@@ -502,33 +451,224 @@ impl eframe::App for Flasher {
     }
 }
 
+#[derive(Debug)]
+enum DownloadError {
+    Network(String),
+    Http(u32),
+}
+
+impl std::fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DownloadError::Network(e) => write!(f, "network error: {}", e),
+            DownloadError::Http(403) => write!(f, "HTTP 403 (GitHub rate limit? try again in an hour)"),
+            DownloadError::Http(code) => write!(f, "HTTP {}", code),
+        }
+    }
+}
+
+/// GET a URL, following redirects. Only a 200 response counts as success.
+fn download(url: &str) -> Result<Vec<u8>, DownloadError> {
+    let net = |e: curl::Error| DownloadError::Network(e.to_string());
+    let mut data = Vec::new();
+    let mut handle = Easy::new();
+    handle.url(url).map_err(net)?;
+    handle.useragent("PineFlash").map_err(net)?;
+    handle.follow_location(true).map_err(net)?;
+    handle.connect_timeout(Duration::from_secs(15)).map_err(net)?;
+    // Abort if the transfer stalls (below 1 byte/s for 30 s) rather than hanging forever.
+    handle.low_speed_limit(1).map_err(net)?;
+    handle.low_speed_time(Duration::from_secs(30)).map_err(net)?;
+    {
+        let mut transfer = handle.transfer();
+        transfer
+            .write_function(|new_data| {
+                data.extend_from_slice(new_data);
+                Ok(new_data.len())
+            })
+            .map_err(net)?;
+        transfer.perform().map_err(net)?;
+    }
+    match handle.response_code().map_err(net)? {
+        200 => Ok(data),
+        code => Err(DownloadError::Http(code)),
+    }
+}
+
+impl Flasher {
+    /// Unpack the release's metadata.zip and fill the language list. Returns the number of languages.
+    fn load_languages(&mut self, zip_path: &std::path::Path) -> Result<usize, String> {
+        let mut data = Vec::new();
+        File::open(zip_path)
+            .and_then(|mut f| f.read_to_end(&mut data))
+            .map_err(|e| format!("download failed ({})", e))?;
+        let target_dir: PathBuf = std::env::temp_dir().join("metadata");
+        let _ = fs::remove_dir_all(&target_dir); // don't read stale files from an older release
+        zip_extract::extract(Cursor::new(data), &target_dir, false)
+            .map_err(|e| format!("invalid metadata.zip ({})", e))?;
+        let json_path = target_dir.join(format!("{}.json", self.config.int_name));
+        self.config.json = fs::read_to_string(&json_path)
+            .map_err(|e| format!("{} missing ({})", json_path.display(), e))?;
+        let value: YourValue = serde_json::from_str(self.config.json.as_str())
+            .map_err(|e| format!("unexpected metadata format ({})", e))?;
+        let mut langs: Vec<(String, String)> = value
+            .contents
+            .into_iter()
+            .filter(|(file, _)| !file.contains(".hex"))
+            .map(|(_, l)| (l.language_name, l.language_code))
+            .collect();
+        langs.sort();
+        self.config.fancy_names = langs.iter().map(|l| l.0.clone()).collect();
+        self.config.code_names = langs.into_iter().map(|l| l.1).collect();
+        Ok(self.config.code_names.len())
+    }
+}
+
+/// Colours for PineFlash's flat look (hairline borders, quiet fills, one solid primary button).
+pub struct Palette {
+    pub page: Color32,
+    pub sidebar: Color32,
+    pub field: Color32,
+    pub field_hover: Color32,
+    pub border: Color32,
+    pub border_strong: Color32,
+    pub text: Color32,
+    pub muted: Color32,
+    pub code_bg: Color32,
+}
+
+pub fn palette(dark: bool) -> Palette {
+    if dark {
+        Palette {
+            page: Color32::from_rgb(38, 38, 36),
+            sidebar: Color32::from_rgb(31, 31, 30),
+            field: Color32::from_rgb(38, 38, 36),
+            field_hover: Color32::from_rgb(48, 48, 46),
+            border: Color32::from_rgb(66, 66, 63),
+            border_strong: Color32::from_rgb(96, 96, 92),
+            text: Color32::from_rgb(236, 235, 230),
+            muted: Color32::from_rgb(160, 158, 150),
+            code_bg: Color32::from_rgb(46, 46, 44),
+        }
+    } else {
+        Palette {
+            page: Color32::from_rgb(255, 255, 255),
+            sidebar: Color32::from_rgb(248, 247, 244),
+            field: Color32::from_rgb(255, 255, 255),
+            field_hover: Color32::from_rgb(244, 243, 239),
+            border: Color32::from_rgb(222, 220, 213),
+            border_strong: Color32::from_rgb(190, 188, 180),
+            text: Color32::from_rgb(31, 30, 29),
+            muted: Color32::from_rgb(110, 108, 102),
+            code_bg: Color32::from_rgb(241, 239, 232),
+        }
+    }
+}
+
+/// Dark or light theme: flat surfaces, 1px hairline borders, rounded controls.
+pub fn apply_theme(ctx: &Context, dark: bool) {
+    let p = palette(dark);
+    let accent = submodules::main_panel::GREEN;
+    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    v.panel_fill = p.page;
+    v.window_fill = p.page;
+    v.window_stroke = Stroke::new(1.0_f32, p.border);
+    v.extreme_bg_color = p.code_bg;
+    v.faint_bg_color = p.sidebar;
+    v.override_text_color = None;
+    v.selection.bg_fill = accent.gamma_multiply(0.45);
+    v.selection.stroke = Stroke::new(1.0_f32, accent);
+    v.hyperlink_color = if dark { Color32::from_rgb(133, 183, 235) } else { Color32::from_rgb(24, 95, 165) };
+    v.window_rounding = Rounding::same(10.0);
+    v.window_shadow = egui::epaint::Shadow::NONE;
+    v.popup_shadow = egui::epaint::Shadow::NONE;
+
+    let r = Rounding::same(8.0);
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = p.page;
+    w.noninteractive.weak_bg_fill = p.page;
+    w.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.border); // separators, frames
+    w.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
+    for (state, fill, border) in [
+        (&mut w.inactive, p.field, p.border_strong),
+        (&mut w.hovered, p.field_hover, p.border_strong),
+        (&mut w.active, p.field_hover, p.text),
+        (&mut w.open, p.field_hover, p.border_strong),
+    ] {
+        state.bg_fill = fill;
+        state.weak_bg_fill = fill;
+        state.bg_stroke = Stroke::new(1.0_f32, border);
+        state.fg_stroke = Stroke::new(1.0_f32, p.text);
+        state.rounding = r;
+        state.expansion = 0.0;
+    }
+    w.noninteractive.rounding = r;
+    ctx.set_visuals(v);
+    ctx.style_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.button_padding = egui::vec2(12.0, 6.0);
+        s.spacing.interact_size.y = 30.0;
+        s.spacing.combo_width = 200.0;
+    });
+}
+
 fn main() {
-    let options = eframe::NativeOptions::default();
-    // let options = eframe::NativeOptions {
-    //     decorated: true,
-    //     follow_system_theme: true,
-    //     icon_data: Some(eframe::IconData {
-    //         rgba: (ICON.to_vec()),
-    //         width: (32),
-    //         height: (32),
-    //     }),
-    //     resizable: true,
-    //     initial_window_size: Some(emath::Vec2 { x: 780., y: 680. }),
-    //     min_window_size: Some(emath::Vec2 { x: 780., y: 280. }),
-    //     ..Default::default()
-    // };
-    match eframe::run_native(
-        "PineFlash",
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("PineFlash CE")
+        .with_inner_size([860.0, 640.0])
+        .with_min_inner_size([700.0, 480.0]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/pine64logo.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    if let Err(error) = eframe::run_native(
+        "PineFlash CE",
         options,
-        // Box::new(|cc| Box::new(egui_extras::install_image_loaders(&cc.egui_ctx) Flasher::new(cc))),
-        //
         Box::new(|cc| {
             // This gives us image support:
             egui_extras::install_image_loaders(&cc.egui_ctx);
             Box::new(Flasher::new(cc))
         }),
-        ) {
-        Ok(_) => (),
-        Err(error) => panic!("A massive error occured, not sure whats goin on here: \n {}", error),
+    ) {
+        // No console under windows_subsystem = "windows", so show the error in a dialog.
+        rfd::MessageDialog::new()
+            .set_title("PineFlash CE could not start")
+            .set_description(&error.to_string())
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_versions;
+
+    const RELEASES: &str = r#"[
+        {"tag_name":"v2.25-rc1","prerelease":true,"draft":true},
+        {"tag_name":"v2.24-rc1","prerelease":true,"draft":false},
+        {"tag_name":"v2.23","prerelease":false,"draft":false},
+        {"tag_name":"v2.23-rc4","prerelease":true,"draft":false},
+        {"tag_name":"v2.22","prerelease":false,"draft":false},
+        {"tag_name":"v2.21","prerelease":false,"draft":false},
+        {"tag_name":"v2.20","prerelease":false,"draft":false}
+    ]"#;
+
+    #[test]
+    fn stable_only_by_default() {
+        let (v, pre) = parse_versions(RELEASES, false);
+        assert_eq!(v, ["v2.23", "v2.22", "v2.21"]);
+        assert!(pre.is_empty());
+    }
+
+    #[test]
+    fn prereleases_only_when_newer_than_stable() {
+        let (v, pre) = parse_versions(RELEASES, true);
+        assert_eq!(v, ["v2.24-rc1", "v2.23", "v2.22", "v2.21"]);
+        assert_eq!(pre, ["v2.24-rc1"]);
+    }
+
+    #[test]
+    fn bad_json_gives_nothing() {
+        assert!(parse_versions("No Internet", true).0.is_empty());
     }
 }

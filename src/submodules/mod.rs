@@ -1,6 +1,8 @@
+pub mod bl70x;
 mod connection_poller;
 mod flash;
-mod main_panel;
+pub mod main_panel;
+pub mod notify;
 mod top_panel;
 
 // mod download;

@@ -4,7 +4,23 @@
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/spagett1/pineflash?color=187BC0&style=flat-square)](https://github.com/Spagett1/PineFlash/releases/)
 
 
-# PineFlash
+# PineFlash CE
+
+**PineFlash CE (Community Edition) is a continuation of [PineFlash](https://github.com/Spagett1/PineFlash) by Spagett1.** All credit for the original app goes to Spagett1 and its contributors. CE carries it on with fixes and new features.
+
+### New in CE 0.6.0 (beta)
+* **Built-in Pinecil V2 flasher on Windows.** It no longer relies on `blisp`, which fails with "Failed to handshake with device" on some Windows PCs, so it's no longer needed there.
+* **Automatic backup** of the iron's whole flash before every Pinecil V2 flash (saved to `~/PineFlash/backups`), plus a **Restore** button to put a backup back.
+* **Verified flashing:** every written byte is read back and compared. The boot header and the IronOS settings area are left untouched and checked afterwards.
+* **Clear errors instead of crashes** for network problems, GitHub rate limits, missing files and failed flashes.
+* Only stable IronOS releases are offered (pre-releases are skipped).
+* **New interface:** connection status sidebar, built-in connection guide, progress bar, light and dark themes.
+
+> This is a beta. On Linux and macOS the Pinecil V2 is still flashed with `blisp`. Pinecil V1 is unchanged (`dfu-util`).
+
+---
+
+*The original PineFlash README follows.*
 
 <img src="https://user-images.githubusercontent.com/77225642/234575696-e6ea62ae-7189-4a9b-bcfb-7f0c36271ace.png" align="right" width="425" style="float:left">
 
