@@ -8,7 +8,7 @@
 
 **PineFlash CE (Community Edition) is a continuation of [PineFlash](https://github.com/Spagett1/PineFlash) by Spagett1.** All credit for the original app goes to Spagett1 and its contributors. CE carries it on with fixes and new features.
 
-### New in CE 0.6.0 (beta)
+### New in CE 0.6.0
 * **Built-in Pinecil V2 flasher on Windows.** It no longer relies on `blisp`, which fails with "Failed to handshake with device" on some Windows PCs, so it's no longer needed there.
 * **Automatic backup** of the iron's whole flash before every Pinecil V2 flash (saved to `~/PineFlash/backups`), plus a **Restore** button to put a backup back.
 * **Verified flashing:** every written byte is read back and compared. The boot header and the IronOS settings area are left untouched and checked afterwards.
@@ -22,7 +22,7 @@ Get `pineflash-ce-<version>-win64-setup.exe` from the [Releases page](https://gi
 
 To build it yourself: `cargo build --release`, then `scripts\fetch-windows-tools.ps1` (downloads `dfu-util` for the Pinecil V1), then `ISCC Package_Windows_Release.iss` with [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 
-> This is a beta. On Linux and macOS the Pinecil V2 is still flashed with `blisp`. Pinecil V1 is unchanged (`dfu-util`).
+> On Linux and macOS the Pinecil V2 is still flashed with `blisp`. Pinecil V1 is unchanged (`dfu-util`).
 
 ---
 
