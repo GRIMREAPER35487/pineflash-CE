@@ -1,0 +1,91 @@
+# Builds the PineFlash CE Windows installer.
+#   - every push / pull request: run the tests, build the installer, keep it as a workflow artifact
+#   - pushing a tag like v0.6.0-beta.1: also publish a GitHub release with the installer attached
+#     (tags with a "-", e.g. -beta.1, are marked as pre-releases)
+name: Windows installer
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create releases on tag pushes
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version from Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if (-not $ver) { throw "no version in Cargo.toml" }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "Version $ver"
+
+      - name: Tag must match Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $want = "v${{ steps.version.outputs.version }}"
+          if ($tag -ne $want) { throw "tag $tag does not match Cargo.toml version ($want)" }
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Bundle dfu-util (Pinecil V1)
+        shell: pwsh
+        run: ./scripts/fetch-windows-tools.ps1
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build installer
+        id: installer
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          $name = "pineflash-ce-$ver-win64-setup"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DMyAppVersion=$ver" "/F$name" Package_Windows_Release.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          $file = "$name.exe"
+          $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+          "$hash  $file" | Set-Content -Encoding ascii "$file.sha256"
+          "file=$file" >> $env:GITHUB_OUTPUT
+          Write-Host "$file  sha256 $hash"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pineflash-ce-${{ steps.version.outputs.version }}-windows
+          path: |
+            ${{ steps.installer.outputs.file }}
+            ${{ steps.installer.outputs.file }}.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: PineFlash CE ${{ steps.version.outputs.version }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.installer.outputs.file }}
+            ${{ steps.installer.outputs.file }}.sha256

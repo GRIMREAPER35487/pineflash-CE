@@ -1,11 +1,14 @@
-; PineFlash CE installer (Inno Setup).
-; Build from the repo root after `cargo build --release`:
+; PineFlash CE installer (Inno Setup 6).
+; Build from the repo root after `cargo build --release` and scripts\fetch-windows-tools.ps1:
 ;   ISCC Package_Windows_Release.iss
+; The GitHub workflow passes the version from Cargo.toml: ISCC /DMyAppVersion=x.y.z ...
 ; For the Linux cross-build used by generate-release.sh:
 ;   ISCC /DBuildDir=target\x86_64-pc-windows-gnu\release Package_Windows_Release.iss
 
 #define MyAppName "PineFlash CE"
-#define MyAppVersion "0.6.0-beta.1"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.6.0-beta.1"
+#endif
 #define MyAppPublisher "GRIMREAPER35487"
 #define MyAppURL "https://github.com/GRIMREAPER35487/pineflash-CE"
 #define MyAppExeName "pineflash.exe"
@@ -24,6 +27,9 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 AppComments=Community continuation of PineFlash by Spagett1
+; pineflash.exe is 64-bit: install into "Program Files", not "Program Files (x86)".
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile={#SourcePath}LICENSE

@@ -13,8 +13,14 @@
 * **Automatic backup** of the iron's whole flash before every Pinecil V2 flash (saved to `~/PineFlash/backups`), plus a **Restore** button to put a backup back.
 * **Verified flashing:** every written byte is read back and compared. The boot header and the IronOS settings area are left untouched and checked afterwards.
 * **Clear errors instead of crashes** for network problems, GitHub rate limits, missing files and failed flashes.
-* Only stable IronOS releases are offered (pre-releases are skipped).
-* **New interface:** connection status sidebar, built-in connection guide, progress bar, light and dark themes.
+* Stable IronOS releases by default, with an optional **Show pre-releases** switch for release candidates.
+* **Boot logos on the Pinecil V2** (Windows built-in flasher): a gallery of IronOS-Meta's logos, drawn as the iron shows them, animated ones included. Only the logo area is written, after a backup.
+* **New interface:** connection status sidebar, built-in connection guide, progress bar, notifications, light and dark themes.
+
+### Download (Windows)
+Get `pineflash-ce-<version>-win64-setup.exe` from the [Releases page](https://github.com/GRIMREAPER35487/pineflash-CE/releases). Installers are built by GitHub Actions from the tagged source (see `.github/workflows/windows-installer.yml`), with a `.sha256` checksum next to each one.
+
+To build it yourself: `cargo build --release`, then `scripts\fetch-windows-tools.ps1` (downloads `dfu-util` for the Pinecil V1), then `ISCC Package_Windows_Release.iss` with [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 
 > This is a beta. On Linux and macOS the Pinecil V2 is still flashed with `blisp`. Pinecil V1 is unchanged (`dfu-util`).
 
