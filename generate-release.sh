@@ -37,7 +37,7 @@ distrobox enter --name fedora-dev -- fpm -s dir -t rpm \
   --depends dfu-util \
   -p "pineflash-fedora-$ver-$arch.rpm" \
   --description "flashing tool for pinecil soldering irons." \
-  --url "https://github.com/GRIMREAPER35487/pineflash" \
+  --url "https://github.com/GRIMREAPER35487/pineflash-CE" \
   --maintainer "spagett <laar@tutanota.com>" \
   target/release/pineflash=/usr/bin/pineflash assets/Pineflash.desktop=/usr/share/applications/Pineflash.desktop assets/pine64logo.png=/usr/share/pixmaps/pine64logo.png LICENSE=/usr/share/licenses/pineflash/LICENSE tools/linux/blisp=/usr/bin/blisp
 
@@ -55,7 +55,7 @@ cargo clean
 #   --depends dfu-util \
 #   -p "pineflash-rhel9-$ver-$arch.rpm" \
 #   --description "flashing tool for pinecil soldering irons." \
-#   --url "https://github.com/GRIMREAPER35487/pineflash" \
+#   --url "https://github.com/GRIMREAPER35487/pineflash-CE" \
 #   --maintainer "spagett <laar@tutanota.com>" \
 #   target/release/pineflash=/usr/bin/pineflash assets/Pineflash.desktop=/usr/share/applications/Pineflash.desktop assets/pine64logo.png=/usr/share/pixmaps/pine64logo.png LICENSE=/usr/share/licenses/pineflash/LICENSE tools/linux/blisp=/usr/bin/blisp
 
@@ -73,7 +73,7 @@ distrobox enter --name debian-dev -- fpm -s dir -t deb \
   --depends dfu-util \
   --depends libxkbcommon0 \
   --description "Flashing tool for pinecil soldering irons." \
-  --url "https://github.com/GRIMREAPER35487/pineflash" \
+  --url "https://github.com/GRIMREAPER35487/pineflash-CE" \
   --maintainer "Spagett <laar@tutanota.com>" \
   target/release/pineflash=/usr/bin/pineflash assets/Pineflash.desktop=/usr/share/applications/Pineflash.desktop assets/pine64logo.png=/usr/share/pixmaps/pine64logo.png LICENSE=/usr/share/licenses/pineflash/LICENSE tools/linux/blisp=/usr/bin/blisp
 
@@ -91,7 +91,7 @@ distrobox enter --name arch-dev -- fpm -s dir -t pacman \
   --depends libxkbcommon \
   --depends dfu-util \
   --description "Flashing tool for pinecil soldering irons." \
-  --url "https://github.com/GRIMREAPER35487/pineflash" \
+  --url "https://github.com/GRIMREAPER35487/pineflash-CE" \
   --maintainer "Spagett <laar@tutanota.com>" \
   target/release/pineflash=/usr/bin/pineflash assets/Pineflash.desktop=/usr/share/applications/Pineflash.desktop assets/pine64logo.png=/usr/share/pixmaps/pine64logo.png LICENSE=/usr/share/licenses/pineflash/LICENSE tools/linux/blisp=/usr/bin/blisp
 # # Generate generic release
@@ -102,7 +102,7 @@ distrobox enter --name arch-dev -- fpm -s dir -t pacman \
 #   --architecture $arch \
 #   --depends polkit \
 #   --description "Flashing tool for pinecil soldering irons." \
-#   --url "https://github.com/GRIMREAPER35487/pineflash" \
+#   --url "https://github.com/GRIMREAPER35487/pineflash-CE" \
 #   --maintainer "Spagett <laar@tutanota.com>" \
 #   target/release/pineflash=/usr/bin/pineflash assets/Pineflash.desktop=/usr/share/applications/Pineflash.desktop assets/pine64logo.png=/usr/share/pixmaps/pine64logo.png LICENSE=/usr/share/licenses/pineflash/LICENSE
 # mv pineflash.tar pineflash-$ver-1-x86_64.tar

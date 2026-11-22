@@ -4,7 +4,7 @@ version = "0.6.0-beta.1"
 edition = "2021"
 build = "build.rs"
 description = "PineFlash CE: a community continuation of PineFlash, the IronOS flasher for Pinecil V1 and V2"
-repository = "https://github.com/GRIMREAPER35487/pineflash"
+repository = "https://github.com/GRIMREAPER35487/pineflash-CE"
 license = "GPL-2.0-only"
 [[bin]]
 name = "pineflash"
