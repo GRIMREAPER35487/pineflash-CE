@@ -56,6 +56,8 @@ struct FlasherConfig {
     json: String,
     iron_connected: Option<String>,
     last_poll: std::time::Instant,
+    /// A USB scan running in the background, if any.
+    poll_rx: Option<std::sync::mpsc::Receiver<submodules::connection_poller::Scan>>,
     flash: bool,
     flash_notified_count: i32,
     v2_serial_path: Option<String>,
@@ -74,6 +76,9 @@ struct FlasherConfig {
     /// None = automatic (shown while no iron is connected)
     show_guide: Option<bool>,
     backup_count: usize,
+    /// Boot logo mode instead of firmware mode.
+    logo_mode: bool,
+    logo: submodules::logos::LogoState,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -181,7 +186,9 @@ impl Default for FlasherConfig {
             logs: format!("PineFlash CE v{} MacOs\n", env!("CARGO_PKG_VERSION")),
             json: "".to_string(),
             iron_connected: None,
-            last_poll: std::time::Instant::now(),
+            // Scan right away at startup instead of after the first interval.
+            last_poll: std::time::Instant::now() - Duration::from_secs(10),
+            poll_rx: None,
             flash: false,
             flash_notified_count: 0,
             v2_serial_path: None,
@@ -207,6 +214,8 @@ impl Default for FlasherConfig {
             last_version: "Select".to_string(),
             show_guide: None,
             backup_count: submodules::main_panel::count_backups(),
+            logo_mode: false,
+            logo: Default::default(),
         }
     }
 }
@@ -237,14 +246,8 @@ impl eframe::App for Flasher {
 
         self.poll_native_flash();
 
-        if self.config.last_poll.elapsed() >= Duration::from_millis(1500)
-            && self.config.flash_events.is_none()
-        {
-            // Don't poll USB while flashing: the iron re-enumerates mid-flash.
-            self.config.last_poll = std::time::Instant::now();
-            self.config.iron_connected = Flasher::check_connections(self);
-            self.config.backup_count = submodules::main_panel::count_backups();
-        }
+        // USB scan on a background thread (not while flashing: the iron re-enumerates mid-flash).
+        self.poll_connections();
 
         if self.config.download_versions {
             let _ = std::fs::remove_file(self.config.metadata_path.clone());
@@ -452,7 +455,7 @@ impl eframe::App for Flasher {
 }
 
 #[derive(Debug)]
-enum DownloadError {
+pub(crate) enum DownloadError {
     Network(String),
     Http(u32),
 }
@@ -468,7 +471,7 @@ impl std::fmt::Display for DownloadError {
 }
 
 /// GET a URL, following redirects. Only a 200 response counts as success.
-fn download(url: &str) -> Result<Vec<u8>, DownloadError> {
+pub(crate) fn download(url: &str) -> Result<Vec<u8>, DownloadError> {
     let net = |e: curl::Error| DownloadError::Network(e.to_string());
     let mut data = Vec::new();
     let mut handle = Easy::new();

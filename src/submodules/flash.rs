@@ -117,8 +117,10 @@ impl Flasher {
     // ----------------------------------------------------------------------
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn start_native_flash(&mut self, firmware_path: String) {
-        if !firmware_path.to_lowercase().ends_with(".bin") {
-            self.flash_failed("The built-in Pinecil V2 flasher only accepts .bin firmware files.");
+        let lower = firmware_path.to_lowercase();
+        let is_logo = lower.ends_with(".dfu");
+        if !lower.ends_with(".bin") && !is_logo {
+            self.flash_failed("The built-in Pinecil V2 flasher takes .bin firmware or .dfu boot logo files.");
             self.reset_after_flash();
             return;
         }
@@ -135,13 +137,29 @@ impl Flasher {
                 return;
             }
         };
+        let firmware_name = std::path::Path::new(&firmware_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if is_logo {
+            let logo = match bl70x::parse_dfu(&firmware) {
+                Ok(l) => l,
+                Err(e) => {
+                    self.flash_failed(&format!("{}: {}", firmware_name, e));
+                    self.reset_after_flash();
+                    return;
+                }
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            bl70x::spawn(tx, move |ev| bl70x::flash_logo(&port, logo, &firmware_name, backup_dir(), ev));
+            self.native_job_started(rx, "Flashing boot logo");
+            self.config.flash = false;
+            return;
+        }
         let job = FlashJob {
             port,
             firmware,
-            firmware_name: std::path::Path::new(&firmware_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            firmware_name,
             backup_dir: backup_dir(),
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -201,8 +219,13 @@ impl Flasher {
         match result {
             Ok(msg) => {
                 self.config.logs.push_str(format!("PineFlash: {}\n", msg).as_str());
+                let text = if msg.starts_with("Boot logo") {
+                    "Boot logo flashed and verified\nYour iron restarts and shows it. If it doesn't, unplug it and plug it back in."
+                } else {
+                    "Flashed and verified\nYour iron restarts into the new firmware. If it doesn't, unplug it and plug it back in."
+                };
                 self.toasts
-                    .success("Flashed and verified\nYour iron restarts into the new firmware. If it doesn't, unplug it and plug it back in.")
+                    .success(text)
                     .set_duration(Some(Duration::from_secs(8)))
                     .set_closable(true);
             }

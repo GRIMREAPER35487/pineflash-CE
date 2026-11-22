@@ -14,6 +14,7 @@ use std::process::Command;
 use version_compare::Version;
 
 use super::flash::backup_dir;
+use super::logos;
 use crate::Flasher;
 
 pub const GREEN: Color32 = Color32::from_rgb(29, 158, 117);
@@ -122,7 +123,11 @@ impl Flasher {
             self.config.version != *"Select"
         };
         if !chosen {
-            return Some("Choose a firmware version or a file.".into());
+            return Some(if self.config.logo_mode {
+                "Choose a logo above.".into()
+            } else {
+                "Choose a firmware version or a file.".into()
+            });
         }
         None
     }
@@ -274,6 +279,9 @@ impl Flasher {
         let p = crate::palette(self.saved_config.dark_mode);
         let busy = self.busy();
 
+        self.render_mode_switch(ui, busy);
+        ui.add_space(14.);
+
         field_label(ui, "Iron");
         ui.add_enabled_ui(!busy, |ui| {
             egui::ComboBox::from_id_source("iron")
@@ -300,6 +308,9 @@ impl Flasher {
 
         ui.add_space(12.);
         let mut open_picker = false;
+        if self.config.logo_mode {
+            self.render_logo_gallery(ui, busy);
+        } else {
         ui.columns(2, |cols| {
             field_label(&mut cols[0], "Firmware");
             cols[0].add_enabled_ui(!busy, |ui| {
@@ -380,6 +391,7 @@ impl Flasher {
                     });
             });
         });
+        }
         if open_picker {
             let mut dialog = FileDialog::open_file(home_dir()).default_size(emath::Vec2 { x: 420., y: 320. });
             dialog.open();
@@ -400,7 +412,7 @@ impl Flasher {
             }
         }
 
-        if let Some(path) = self.config.picked_path.clone() {
+        if let Some(path) = self.config.picked_path.clone().filter(|_| !self.config.logo_mode) {
             ui.add_space(4.);
             ui.horizontal(|ui| {
                 let name = Path::new(&path)
@@ -427,7 +439,12 @@ impl Flasher {
             ui.add_space(4.);
             ui.label(RichText::new("Keep the iron plugged in.").size(12.5).weak());
         } else {
+            let erase_picked = self.config.logo_mode
+                && self.config.picked_path.as_deref().map_or(false, |p| p.contains("erase_stored_image"));
             let label = match self.config.version.as_str() {
+                _ if erase_picked => "Remove boot logo".to_string(),
+                "Custom" if self.config.logo_mode => "Flash boot logo".to_string(),
+                "Select" if self.config.logo_mode => "Flash boot logo".to_string(),
                 "Custom" => "Flash file".to_string(),
                 "Select" => "Flash".to_string(),
                 v => format!("Flash {}", v),
@@ -464,6 +481,238 @@ impl Flasher {
         }
     }
 
+
+    // ------------------------------------------------------------------
+    // Firmware / Boot logo switch
+    // ------------------------------------------------------------------
+    fn render_mode_switch(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let p = crate::palette(self.saved_config.dark_mode);
+        let selected_fill = if self.saved_config.dark_mode { p.field_hover } else { p.page };
+        Frame::none()
+            .fill(p.sidebar)
+            .stroke(egui::Stroke::new(1.0_f32, p.border))
+            .rounding(Rounding::same(9.))
+            .inner_margin(Margin::same(3.))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.;
+                    for (logo, label) in [(false, "Firmware"), (true, "Boot logo")] {
+                        let selected = self.config.logo_mode == logo;
+                        let text = RichText::new(label).size(13.5).color(if selected { p.text } else { p.muted });
+                        let button = Button::new(if selected { text.strong() } else { text })
+                            .fill(if selected { selected_fill } else { Color32::TRANSPARENT })
+                            .stroke(if selected { egui::Stroke::new(1.0_f32, p.border) } else { egui::Stroke::NONE })
+                            .rounding(Rounding::same(7.))
+                            .min_size(Vec2::new(118., 28.));
+                        if ui.add_enabled(!busy, button).clicked() && !selected {
+                            self.config.logo_mode = logo;
+                            self.config.picked_path = None;
+                            self.config.version = "Select".to_string();
+                        }
+                    }
+                });
+            });
+    }
+
+    // ------------------------------------------------------------------
+    // Boot logo gallery
+    // ------------------------------------------------------------------
+    fn start_logo_download(&mut self) {
+        let iron = self.config.int_name.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(logos::download_pack(&iron));
+        });
+        self.config.logo.download = Some(rx);
+        self.config.logs.push_str("PineFlash: Downloading boot logos from IronOS-Meta.\n");
+    }
+
+    fn render_logo_gallery(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let p = crate::palette(self.saved_config.dark_mode);
+        let ctx = ui.ctx().clone();
+        let iron = self.config.int_name.clone();
+
+        // Load (or download) the pack for the selected iron.
+        if self.config.logo.loaded_for != iron && self.config.logo.download.is_none() {
+            self.config.logo.loaded_for = iron.clone();
+            self.config.logo.logos = logos::load(&logos::logos_dir(&iron));
+            self.config.logo.textures.clear();
+            if self.config.logo.logos.is_empty() {
+                self.start_logo_download();
+            }
+        }
+        let finished = match &self.config.logo.download {
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("the download stopped".into())),
+            },
+            None => None,
+        };
+        if let Some(result) = finished {
+            self.config.logo.download = None;
+            match result {
+                Ok(n) => {
+                    self.config.logo.logos = logos::load(&logos::logos_dir(&iron));
+                    self.config.logo.textures.clear();
+                    self.config.logo.loaded_for = iron.clone();
+                    self.config.logs.push_str(format!("PineFlash: {} boot logo files downloaded.\n", n).as_str());
+                    self.toasts
+                        .success(format!("Boot logos ready\n{} logos from IronOS-Meta.", self.config.logo.logos.len()))
+                        .set_duration(Some(Duration::from_secs(4)));
+                }
+                Err(e) => {
+                    self.config.logs.push_str(format!("PineFlash: {}\n", e).as_str());
+                    self.toasts
+                        .error(format!("Could not get the boot logos\n{}", e))
+                        .set_duration(Some(Duration::from_secs(6)));
+                }
+            }
+        }
+
+        // Header row: label on the left, options on the right.
+        ui.horizontal(|ui| {
+            field_label(ui, "Boot logo");
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 12.;
+                if self.config.logo.download.is_none() && ui.link("Refresh").on_hover_text("Download the latest logos from IronOS-Meta").clicked() {
+                    self.start_logo_download();
+                }
+                if ui.link("Open folder").clicked() {
+                    open_folder(&logos::logos_dir(&iron));
+                }
+                let mut left = self.config.logo.left_handed;
+                if ui
+                    .checkbox(&mut left, RichText::new("Left-handed").size(12.5).color(p.muted))
+                    .on_hover_text("Use the logos turned upside down, for irons set to left-handed mode.")
+                    .changed()
+                {
+                    self.config.logo.left_handed = left;
+                    // Swap an already chosen logo to the matching variant.
+                    if let Some(picked) = self.config.picked_path.clone() {
+                        for l in &self.config.logo.logos {
+                            let right = l.path.display().to_string();
+                            let lefty = l.left_path.as_ref().map(|x| x.display().to_string());
+                            if picked == right || Some(&picked) == lefty.as_ref() {
+                                let want = if left { lefty.clone().unwrap_or(right) } else { right };
+                                self.config.picked_path = Some(want);
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        ui.add_space(6.);
+
+        if self.config.logo.download.is_some() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.));
+                ui.label(RichText::new("Downloading logos from IronOS-Meta...").color(p.muted));
+            });
+            return;
+        }
+        if self.config.logo.logos.is_empty() {
+            ui.label(RichText::new("No logos yet.").color(p.muted));
+            if ui.button("Download logos").clicked() {
+                self.start_logo_download();
+            }
+            return;
+        }
+
+        ui.add(
+            egui::TextEdit::singleline(&mut self.config.logo.filter)
+                .hint_text("Search logos")
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(8.);
+
+        let filter = self.config.logo.filter.to_lowercase();
+        let time = ctx.input(|i| i.time);
+        let left = self.config.logo.left_handed;
+        let picked = self.config.picked_path.clone();
+        let mut clicked: Option<String> = None;
+        let mut animating = false;
+        let card = Vec2::new(212., 78.);
+        let screen_size = Vec2::new(192., 32.);
+        let oled_off = Color32::from_rgb(10, 10, 12);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(10., 10.);
+            let st = &mut self.config.logo;
+            for i in 0..st.logos.len() {
+                if !filter.is_empty() && !st.logos[i].name.to_lowercase().contains(&filter) {
+                    continue;
+                }
+                let logo = &st.logos[i];
+                let path = if left { logo.left_path.clone().unwrap_or(logo.path.clone()) } else { logo.path.clone() };
+                let path_s = path.display().to_string();
+                let selected = picked.as_deref() == Some(path_s.as_str());
+
+                let (rect, resp) = ui.allocate_exact_size(card, egui::Sense::click());
+                let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                let border = if selected {
+                    egui::Stroke::new(2.0_f32, GREEN)
+                } else if resp.hovered() {
+                    egui::Stroke::new(1.0_f32, p.border_strong)
+                } else {
+                    egui::Stroke::new(1.0_f32, p.border)
+                };
+                let painter = ui.painter_at(rect.expand(2.));
+                painter.rect(rect, Rounding::same(8.), p.field, border);
+
+                let screen = egui::Rect::from_min_size(rect.min + Vec2::new(10., 9.), screen_size);
+                painter.rect_filled(screen.expand(3.), Rounding::same(4.), oled_off);
+                if logo.is_erase() {
+                    painter.text(
+                        screen.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "blank",
+                        egui::FontId::proportional(12.),
+                        Color32::from_gray(110),
+                    );
+                } else {
+                    let n = logo.frames.len();
+                    let idx = if n > 1 && logo.frame_ms > 0 {
+                        animating = true;
+                        ((time * 1000.0) as u64 / logo.frame_ms as u64) as usize % n
+                    } else {
+                        0
+                    };
+                    if let Some(tex) = logos::frame_texture(&ctx, &mut st.textures, &st.logos[i], idx) {
+                        let mut img = egui::Image::new(&tex);
+                        if left {
+                            // Left-handed logos are the same picture turned 180 degrees.
+                            img = img.uv(egui::Rect::from_min_max(egui::pos2(1., 1.), egui::pos2(0., 0.)));
+                        }
+                        img.paint_at(ui, screen);
+                    }
+                }
+                let logo = &st.logos[i];
+                let mut name = logo.name.clone();
+                if logo.frames.len() > 1 {
+                    name.push_str("  · animated");
+                }
+                painter.text(
+                    egui::pos2(rect.min.x + 11., rect.max.y - 15.),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    egui::FontId::proportional(12.5),
+                    if selected { p.text } else { p.muted },
+                );
+                if resp.clicked() && !busy {
+                    clicked = Some(path_s);
+                }
+            }
+        });
+        if animating {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+        if let Some(path) = clicked {
+            self.config.picked_path = Some(path);
+            self.config.version = "Custom".to_string();
+        }
+    }
 
     // ------------------------------------------------------------------
     // Connection guide
@@ -579,24 +828,16 @@ impl Flasher {
         self.config.open_file_dialog = None;
 
         let ext = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        // On Windows the V2 is flashed by the built-in flasher, which takes raw .bin files.
+        // On Windows the V2 is flashed by the built-in flasher: .bin firmware or .dfu boot logos.
         let native_v2 = cfg!(target_os = "windows") && self.config.int_name == "Pinecilv2";
         let ok_ext = if self.config.int_name == "Pinecil" {
             ext == "dfu"
-        } else if native_v2 {
-            ext == "bin"
         } else {
             ext == "bin" || ext == "dfu"
         };
         if !ok_ext {
             self.toasts.dismiss_all_toasts();
-            let want = if self.config.int_name == "Pinecil" {
-                ".dfu"
-            } else if native_v2 {
-                ".bin"
-            } else {
-                ".bin or .dfu"
-            };
+            let want = if self.config.int_name == "Pinecil" { ".dfu" } else { ".bin or .dfu" };
             self.toasts
                 .error(format!("Wrong file type\nThis iron needs a {} file.", want))
                 .set_duration(Some(Duration::from_secs(4)))

@@ -1,6 +1,7 @@
 pub mod bl70x;
-mod connection_poller;
+pub mod connection_poller;
 mod flash;
+pub mod logos;
 pub mod main_panel;
 pub mod notify;
 mod top_panel;

@@ -642,6 +642,113 @@ pub fn flash_firmware(job: FlashJob, ev: &Sender<FlashEvent>) -> FlashResult<Str
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Boot logos (IronOS-Meta .dfu files)
+// ---------------------------------------------------------------------------
+
+/// Flash is memory-mapped here; DFU files carry mapped addresses.
+const XIP_BASE: u32 = 0x2300_0000;
+
+/// One image to write at a flash offset.
+#[derive(Debug)]
+pub struct DfuImage {
+    pub offset: u32,
+    pub data: Vec<u8>,
+}
+
+/// Parse a DfuSe file for the Pinecil V2: the image's flash offset and data.
+pub fn parse_dfu(b: &[u8]) -> FlashResult<DfuImage> {
+    let (addr, data) = parse_dfu_raw(b)?;
+    if addr < XIP_BASE {
+        return Err(format!("DFU image address 0x{:08X} is not in flash", addr));
+    }
+    Ok(DfuImage { offset: addr - XIP_BASE, data })
+}
+
+/// Parse a DfuSe file (as made by IronOS-Meta): exactly one target with one element.
+/// Returns (address, data). The suffix CRC is checked so a damaged file is never used.
+pub fn parse_dfu_raw(b: &[u8]) -> FlashResult<(u32, Vec<u8>)> {
+    const PREFIX: usize = 11;
+    const TARGET: usize = 274;
+    const SUFFIX: usize = 16;
+    let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+
+    if b.len() < PREFIX + TARGET + 8 + SUFFIX || &b[..5] != b"DfuSe" || b[5] != 1 {
+        return Err("not a DfuSe file".into());
+    }
+    let n = b.len();
+    if &b[n - 8..n - 5] != b"UFD" || b[n - 5] as usize != SUFFIX {
+        return Err("DFU file has no valid suffix".into());
+    }
+    let stored_crc = u32_at(n - 4);
+    if stored_crc != !crc32(&b[..n - 4]) {
+        return Err("DFU file is damaged (CRC mismatch)".into());
+    }
+    // Tools disagree on whether this size includes the suffix (IronOS-Meta includes it).
+    let declared = u32_at(6) as usize;
+    if declared != n - SUFFIX && declared != n {
+        return Err("DFU file size does not match its header".into());
+    }
+    if b[10] != 1 {
+        return Err(format!("DFU file has {} targets, expected 1", b[10]));
+    }
+    if &b[PREFIX..PREFIX + 6] != b"Target" {
+        return Err("DFU target header missing".into());
+    }
+    if u32_at(PREFIX + 270) != 1 {
+        return Err("DFU file must contain exactly one image".into());
+    }
+    let e = PREFIX + TARGET;
+    let addr = u32_at(e);
+    let size = u32_at(e + 4) as usize;
+    if e + 8 + size != n - SUFFIX {
+        return Err("DFU image size does not match the file".into());
+    }
+    Ok((addr, b[e + 8..e + 8 + size].to_vec()))
+}
+
+/// Write a boot logo. IronOS keeps it in the sector just below the settings sector; nothing
+/// else is erased, and afterwards the whole flash outside that sector is compared to the backup.
+pub fn flash_logo(port: &str, logo: DfuImage, name: &str, backup_dir: PathBuf, ev: &Sender<FlashEvent>) -> FlashResult<String> {
+    let _ = ev.send(FlashEvent::Stage("Connecting to the iron".into()));
+    let mut dev = Bl70x::connect(port, ev)?;
+    let (id, size) = dev.flash_id()?;
+    let logo_sector = size - 2 * SECTOR;
+    let _ = ev.send(FlashEvent::Log(format!(
+        "PineFlash: flash {:02X?}, {} KiB; boot logo {} ({} bytes) -> 0x{:06X}",
+        id, size / 1024, name, logo.data.len(), logo.offset
+    )));
+    if logo.offset != logo_sector || logo.data.is_empty() || logo.data.len() > SECTOR as usize {
+        return Err(format!(
+            "{} is not a Pinecil V2 boot logo (it targets 0x{:06X}, {} bytes; logos go at 0x{:06X}, up to {} bytes)",
+            name, logo.offset, logo.data.len(), logo_sector, SECTOR
+        ));
+    }
+
+    let (backup_path, before) = backup(&mut dev, size, &backup_dir, ev)?;
+
+    let _ = ev.send(FlashEvent::Stage("Writing boot logo".into()));
+    let _ = ev.send(FlashEvent::Progress(0.0));
+    let end = logo_sector + logo.data.len() as u32;
+    dev.erase(logo_sector, end)?;
+    dev.write_flash(logo_sector, &logo.data, |_| {})?;
+    dev.program_check()?;
+    let written = dev.read_flash(logo_sector, logo.data.len() as u32, |_| {})?;
+    compare(&written, &logo.data, logo_sector, "boot logo verify")?;
+
+    // Everything outside the logo sector must be exactly as it was.
+    let _ = ev.send(FlashEvent::Stage("Checking firmware and settings are untouched".into()));
+    let after = dev.read_flash(0, size, |done| {
+        let _ = ev.send(FlashEvent::Progress(done as f32 / size as f32));
+    })?;
+    let ls = logo_sector as usize;
+    compare(&after[..ls], &before[..ls], 0, "flash below the logo")?;
+    compare(&after[ls + SECTOR as usize..], &before[ls + SECTOR as usize..], logo_sector + SECTOR, "settings sector")?;
+
+    dev.reset();
+    Ok(format!("Boot logo {} flashed and verified. Backup: {}", name, backup_path.display()))
+}
+
 /// Put a previous backup's firmware back (header and settings are handled as in flash_firmware).
 pub fn restore_backup(port: &str, backup_file: &Path, backup_dir: PathBuf, ev: &Sender<FlashEvent>) -> FlashResult<String> {
     let data = fs::read(backup_file).map_err(|e| format!("could not read {}: {}", backup_file.display(), e))?;
@@ -759,6 +866,54 @@ mod tests {
         drop(tx);
         printer.join().unwrap();
         result.unwrap();
+    }
+
+    /// Builds a DfuSe file the way IronOS-Meta does.
+    fn make_dfu(addr: u32, data: &[u8]) -> Vec<u8> {
+        let mut b = b"DfuSe\x01".to_vec();
+        let body = 11 + 274 + 8 + data.len();
+        b.extend_from_slice(&(body as u32).to_le_bytes());
+        b.push(1);
+        b.extend_from_slice(b"Target");
+        b.push(0);
+        b.extend_from_slice(&[0u8; 4 + 255]);
+        b.extend_from_slice(&((8 + data.len()) as u32).to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&addr.to_le_bytes());
+        b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        b.extend_from_slice(data);
+        b.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x83, 0x04, 0x1A, 0x01]);
+        b.extend_from_slice(b"UFD");
+        b.push(16);
+        let crc = !crc32(&b);
+        b.extend_from_slice(&crc.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn dfu_parse_logo() {
+        let f = make_dfu(0x230F_E000, &[0xAB; 1024]);
+        assert_eq!(f.len(), 1333); // same size as the IronOS-Meta logos
+        let img = parse_dfu(&f).unwrap();
+        assert_eq!(img.offset, 0xFE000);
+        assert_eq!(img.data, vec![0xAB; 1024]);
+    }
+
+    #[test]
+    fn dfu_rejects_damage() {
+        let mut f = make_dfu(0x230F_E000, &[1; 1024]);
+        f[400] ^= 0xFF;
+        assert!(parse_dfu(&f).unwrap_err().contains("CRC"));
+        assert!(parse_dfu(b"not a dfu file at all").is_err());
+    }
+
+    /// A real logo from IronOS-Meta's pinecilv2.zip, if one is available locally.
+    #[test]
+    fn dfu_parse_real_logo_if_present() {
+        let Ok(path) = std::env::var("PINECIL_LOGO_DFU") else { return };
+        let img = parse_dfu(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(img.offset, 0xFE000);
+        assert_eq!(img.data.len(), 1024);
     }
 
     #[test]
