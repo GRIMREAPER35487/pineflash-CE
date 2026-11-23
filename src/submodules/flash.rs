@@ -37,7 +37,11 @@ impl Flasher {
                 .clone()
                 .ok_or_else(|| "Please select a file or firmware version".to_string());
         }
-        let name = format!("{}-{}", self.config.version, self.config.int_name);
+        let name = format!(
+            "{}-{}",
+            crate::submodules::sources::file_key(&self.config.version),
+            self.config.int_name
+        );
         let zip: PathBuf = std::env::temp_dir().join(format!("{}.zip", name));
         let target: PathBuf = std::env::temp_dir().join(&name);
 

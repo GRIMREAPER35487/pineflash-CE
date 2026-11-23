@@ -5,8 +5,7 @@ use eframe::egui::{
     self, Button, CentralPanel, Color32, Frame, Image, Layout, Margin, RichText, Rounding, ScrollArea,
     SidePanel, Vec2,
 };
-use egui::{emath, Context};
-use egui_file::FileDialog;
+use egui::Context;
 use simple_home_dir::home_dir;
 #[cfg(not(target_os = "windows"))]
 use std::process::Command;
@@ -15,6 +14,14 @@ use version_compare::Version;
 
 use super::flash::backup_dir;
 use super::logos;
+use super::sources;
+
+/// What a native Open dialog is picking a file for.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Pick {
+    Firmware,
+    Restore,
+}
 use crate::Flasher;
 
 pub const GREEN: Color32 = Color32::from_rgb(29, 158, 117);
@@ -155,9 +162,7 @@ impl Flasher {
                 self.render_log(ui);
             });
         });
-        self.show_file_dialog(ctx);
-        #[cfg(target_os = "windows")]
-        self.show_restore_dialog(ctx);
+        self.render_sources_window(ctx);
         self.toasts.show(ctx);
     }
 
@@ -247,28 +252,65 @@ impl Flasher {
             resp.on_disabled_hover_text("Plug in a Pinecil V2 in flashing mode first.")
         };
         if resp.clicked() {
-            let dir = backup_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            let mut dialog = FileDialog::open_file(Some(dir))
-                .default_size(emath::Vec2 { x: 420., y: 320. })
-                .show_files_filter(Box::new(|p: &Path| p.extension().map(|e| e == "bin").unwrap_or(false)));
-            dialog.open();
-            self.config.restore_dialog = Some(dialog);
+            self.open_picker(Pick::Restore);
         }
     }
 
-
-    #[cfg(target_os = "windows")]
-    fn show_restore_dialog(&mut self, ctx: &Context) {
-        let mut picked = None;
-        if let Some(dialog) = &mut self.config.restore_dialog {
-            if dialog.show(ctx).selected() {
-                picked = dialog.path().map(|p| p.to_path_buf());
-            }
+    // ------------------------------------------------------------------
+    // Native Open dialog (runs on its own thread so the window keeps drawing)
+    // ------------------------------------------------------------------
+    pub fn open_picker(&mut self, what: Pick) {
+        if self.config.picker.is_some() {
+            return; // one dialog at a time
         }
-        if let Some(path) = picked {
-            self.config.restore_dialog = None;
-            self.start_restore(path);
+        let (dir, title, filters): (PathBuf, &'static str, Vec<(&'static str, Vec<&'static str>)>) = match what {
+            Pick::Firmware => {
+                let filters = if self.config.int_name == "Pinecil" {
+                    vec![("Pinecil V1 firmware or boot logo (*.dfu)", vec!["dfu"])]
+                } else {
+                    vec![
+                        ("Pinecil V2 firmware or boot logo (*.bin, *.dfu)", vec!["bin", "dfu"]),
+                        ("Firmware (*.bin)", vec!["bin"]),
+                        ("Boot logo (*.dfu)", vec!["dfu"]),
+                    ]
+                };
+                (home_dir().unwrap_or_default(), "Choose a firmware or boot logo file", filters)
+            }
+            Pick::Restore => {
+                let dir = backup_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                (dir, "Choose a PineFlash backup to restore", vec![("PineFlash backup (*.bin)", vec!["bin"])])
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let run = move || {
+            let mut dialog = rfd::FileDialog::new().set_title(title).set_directory(&dir);
+            for (name, exts) in &filters {
+                dialog = dialog.add_filter(name, exts);
+            }
+            let _ = tx.send(dialog.pick_file());
+        };
+        // macOS only allows dialogs on the main thread; elsewhere keep the UI running.
+        #[cfg(target_os = "macos")]
+        run();
+        #[cfg(not(target_os = "macos"))]
+        std::thread::spawn(run);
+        self.config.picker = Some((what, rx));
+    }
+
+    pub fn poll_picker(&mut self) {
+        let Some((what, rx)) = &self.config.picker else { return };
+        let what = *what;
+        let picked = match rx.try_recv() {
+            Ok(p) => p,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.config.picker = None;
+        let Some(path) = picked else { return }; // cancelled
+        match what {
+            Pick::Firmware => self.use_picked_file(path),
+            Pick::Restore => self.start_restore(path),
         }
     }
 
@@ -324,19 +366,63 @@ impl Flasher {
                         v.to_string()
                     }
                 };
+                // Custom sources: (repo, [(version value, label)], note when there's nothing to pick).
+                let int_name = self.config.int_name.clone();
+                let custom: Vec<(String, Vec<(String, String)>, Option<String>)> = self
+                    .saved_config
+                    .sources
+                    .iter()
+                    .map(|repo| {
+                        let entries: Vec<(String, String)> = sources::releases_for(&self.config.sources, repo, &int_name)
+                            .into_iter()
+                            .map(|r| {
+                                let label = if r.prerelease { format!("{}  (pre-release)", r.tag) } else { r.tag.clone() };
+                                (format!("{}@{}", repo, r.tag), label)
+                            })
+                            .collect();
+                        let pending = self.config.sources.pending.iter().any(|(r, _)| r == repo);
+                        let note = if !entries.is_empty() {
+                            None
+                        } else if pending {
+                            Some("Loading...".to_string())
+                        } else {
+                            match self.config.sources.releases.get(repo) {
+                                Some(Err(e)) => Some(format!("Couldn't load: {}", e)),
+                                _ => Some("No builds for this iron".to_string()),
+                            }
+                        };
+                        (repo.clone(), entries, note)
+                    })
+                    .collect();
                 let shown = match self.config.version.as_str() {
                     "Select" if !self.config.versions_checked => "Loading versions...".to_string(),
                     "Select" => "Choose a version".to_string(),
                     "Custom" => "File on this PC".to_string(),
+                    v if sources::is_custom(v) => sources::display(v),
                     v => describe(v),
                 };
+                let mut manage = false;
                 egui::ComboBox::from_id_source("version")
                     .width(ui.available_width())
+                    .height(520.)
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
+                        if !custom.is_empty() {
+                            ui.label(RichText::new("IronOS (official)").size(12.).weak());
+                        }
                         for v in self.config.vers.clone().iter() {
                             let label = describe(v);
                             ui.selectable_value(&mut self.config.version, v.clone(), label);
+                        }
+                        for (repo, entries, note) in &custom {
+                            ui.separator();
+                            ui.label(RichText::new(repo).size(12.).weak());
+                            for (value, label) in entries {
+                                ui.selectable_value(&mut self.config.version, value.clone(), label);
+                            }
+                            if let Some(n) = note {
+                                ui.label(RichText::new(n).size(12.).weak().italics());
+                            }
                         }
                         ui.separator();
                         if ui
@@ -345,16 +431,41 @@ impl Flasher {
                         {
                             open_picker = true;
                         }
+                        if ui.selectable_label(false, "Manage sources...").clicked() {
+                            manage = true;
+                        }
                     });
+                if manage {
+                    self.config.sources.window_open = true;
+                }
             });
             cols[0].add_space(4.);
             let mut show_pre = self.saved_config.show_prereleases;
+            let mut open_sources = false;
             let toggle = cols[0]
-                .add_enabled(
-                    !busy,
-                    egui::Checkbox::new(&mut show_pre, RichText::new("Show pre-releases").size(12.5).color(p.muted)),
-                )
-                .on_hover_text("Include IronOS release candidates newer than the latest stable release. They are test builds and may have bugs.");
+                .horizontal(|ui| {
+                    let t = ui
+                        .add_enabled(
+                            !busy,
+                            egui::Checkbox::new(&mut show_pre, RichText::new("Show pre-releases").size(12.5).color(p.muted)),
+                        )
+                        .on_hover_text("Include IronOS release candidates newer than the latest stable release. They are test builds and may have bugs.");
+                    ui.add_space(8.);
+                    let n = self.saved_config.sources.len();
+                    let label = if n == 0 { "Sources...".to_string() } else { format!("Sources ({})...", n + 1) };
+                    if ui
+                        .add_enabled(!busy, egui::Link::new(RichText::new(label).size(12.5)))
+                        .on_hover_text("Add GitHub repositories, such as IronOS forks, whose releases appear in this list.")
+                        .clicked()
+                    {
+                        open_sources = true;
+                    }
+                    t
+                })
+                .inner;
+            if open_sources {
+                self.config.sources.window_open = true;
+            }
             if toggle.changed() {
                 self.saved_config.show_prereleases = show_pre;
                 self.save_settings();
@@ -393,9 +504,7 @@ impl Flasher {
         });
         }
         if open_picker {
-            let mut dialog = FileDialog::open_file(home_dir()).default_size(emath::Vec2 { x: 420., y: 320. });
-            dialog.open();
-            self.config.open_file_dialog = Some(dialog);
+            self.open_picker(Pick::Firmware);
         }
 
         if self.config.version != self.config.last_version {
@@ -447,7 +556,7 @@ impl Flasher {
                 "Select" if self.config.logo_mode => "Flash boot logo".to_string(),
                 "Custom" => "Flash file".to_string(),
                 "Select" => "Flash".to_string(),
-                v => format!("Flash {}", v),
+                v => format!("Flash {}", sources::display(v)),
             };
             // One solid primary button, like the mockup.
             let button = Button::new(RichText::new(label).size(15.).color(p.page).strong())
@@ -817,16 +926,7 @@ impl Flasher {
     // ------------------------------------------------------------------
     // Custom firmware file picker
     // ------------------------------------------------------------------
-    fn show_file_dialog(&mut self, ctx: &Context) {
-        let mut picked: Option<PathBuf> = None;
-        if let Some(dialog) = &mut self.config.open_file_dialog {
-            if dialog.show(ctx).selected() {
-                picked = dialog.path().map(|p| p.to_path_buf());
-            }
-        }
-        let Some(file) = picked else { return };
-        self.config.open_file_dialog = None;
-
+    fn use_picked_file(&mut self, file: PathBuf) {
         let ext = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         // On Windows the V2 is flashed by the built-in flasher: .bin firmware or .dfu boot logos.
         let native_v2 = cfg!(target_os = "windows") && self.config.int_name == "Pinecilv2";

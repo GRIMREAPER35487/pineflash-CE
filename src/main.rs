@@ -16,7 +16,6 @@ use eframe::{
 };
 mod submodules;
 use egui::Context;
-use egui_file::FileDialog;
 use submodules::notify::Toasts;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,12 +64,12 @@ struct FlasherConfig {
     current_step: usize,
     json_checked: bool,
     metadata_path: PathBuf,
-    open_file_dialog: Option<FileDialog>,
+    /// A native Open dialog running on a background thread, and what the file is for.
+    picker: Option<(submodules::main_panel::Pick, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
     // Built-in Pinecil V2 flasher (runs on a background thread)
     flash_events: Option<std::sync::mpsc::Receiver<submodules::bl70x::FlashEvent>>,
     flash_stage: String,
     flash_progress: f32,
-    restore_dialog: Option<FileDialog>,
     last_iron: String,
     last_version: String,
     /// None = automatic (shown while no iron is connected)
@@ -79,6 +78,8 @@ struct FlasherConfig {
     /// Boot logo mode instead of firmware mode.
     logo_mode: bool,
     logo: submodules::logos::LogoState,
+    /// Custom firmware sources: fetched release lists and the manager window.
+    sources: submodules::sources::SourcesState,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -87,11 +88,13 @@ struct FlashSavedConfig {
     pub dark_mode: bool,
     /// List IronOS pre-releases (release candidates) newer than the latest stable release.
     pub show_prereleases: bool,
+    /// Extra GitHub repositories ("owner/repo") whose releases are offered as firmware.
+    pub sources: Vec<String>,
 }
 
 impl Default for FlashSavedConfig {
     fn default() -> Self {
-        Self { dark_mode: true, show_prereleases: false }
+        Self { dark_mode: true, show_prereleases: false, sources: Vec::new() }
     }
 }
 
@@ -139,6 +142,7 @@ impl Flasher {
         }
         if self.config.version != "Select"
             && self.config.version != "Custom"
+            && !submodules::sources::is_custom(&self.config.version)
             && !versions.contains(&self.config.version)
         {
             self.config.version = "Select".to_string();
@@ -205,17 +209,17 @@ impl Default for FlasherConfig {
             metadata_path: [std::env::temp_dir(), "metadata.json".into()]
                 .iter()
                 .collect(),
-            open_file_dialog: None,
             flash_events: None,
             flash_stage: String::new(),
             flash_progress: 0.0,
-            restore_dialog: None,
+            picker: None,
             last_iron: "Pinecil V2".to_string(),
             last_version: "Select".to_string(),
             show_guide: None,
             backup_count: submodules::main_panel::count_backups(),
             logo_mode: false,
             logo: Default::default(),
+            sources: Default::default(),
         }
     }
 }
@@ -248,6 +252,9 @@ impl eframe::App for Flasher {
 
         // USB scan on a background thread (not while flashing: the iron re-enumerates mid-flash).
         self.poll_connections();
+        // Fetch release lists for custom firmware sources in the background.
+        self.poll_sources();
+        self.poll_picker();
 
         if self.config.download_versions {
             let _ = std::fs::remove_file(self.config.metadata_path.clone());
@@ -326,12 +333,11 @@ impl eframe::App for Flasher {
         Flasher::render_main_windows(self, ctx);
 
         if self.config.download {
-            let path: PathBuf = [
-                std::env::temp_dir(),
-                format!("{}-{}.zip", self.config.version, self.config.int_name).into(),
-            ]
-            .iter()
-            .collect();
+            let path: PathBuf = std::env::temp_dir().join(format!(
+                "{}-{}.zip",
+                submodules::sources::file_key(&self.config.version),
+                self.config.int_name
+            ));
             let pathlock: PathBuf = [std::env::temp_dir(), "firmware.lock".into()]
                 .iter()
                 .collect();
@@ -352,13 +358,10 @@ impl eframe::App for Flasher {
                 let version = self.config.version.clone();
                 let int_name = self.config.int_name.clone();
                 std::thread::spawn(move || {
-                    let path: PathBuf =
-                        std::env::temp_dir().join(format!("{}-{}.zip", version, int_name));
+                    let path: PathBuf = std::env::temp_dir()
+                        .join(format!("{}-{}.zip", submodules::sources::file_key(&version), int_name));
                     let pathlock: PathBuf = std::env::temp_dir().join("firmware.lock");
-                    let url = format!(
-                        "https://github.com/Ralim/IronOS/releases/download/{}/{}.zip",
-                        version, int_name
-                    );
+                    let url = submodules::sources::asset_url(&version, &format!("{}.zip", int_name));
                     if let Ok(zip) = download(&url) {
                         let _ = std::fs::write(path, zip);
                     }
@@ -406,10 +409,7 @@ impl eframe::App for Flasher {
                     let path: PathBuf = std::env::temp_dir().join("langs.zip");
                     let pathlock: PathBuf = std::env::temp_dir().join("langs.lock");
                     let _ = std::fs::remove_file(&path);
-                    let url = format!(
-                        "https://github.com/Ralim/IronOS/releases/download/{}/metadata.zip",
-                        version
-                    );
+                    let url = submodules::sources::asset_url(&version, "metadata.zip");
                     if let Ok(zip) = download(&url) {
                         let _ = std::fs::write(path, zip);
                     }
@@ -455,7 +455,7 @@ impl eframe::App for Flasher {
 }
 
 #[derive(Debug)]
-pub(crate) enum DownloadError {
+pub enum DownloadError {
     Network(String),
     Http(u32),
 }
@@ -471,7 +471,7 @@ impl std::fmt::Display for DownloadError {
 }
 
 /// GET a URL, following redirects. Only a 200 response counts as success.
-pub(crate) fn download(url: &str) -> Result<Vec<u8>, DownloadError> {
+pub fn download(url: &str) -> Result<Vec<u8>, DownloadError> {
     let net = |e: curl::Error| DownloadError::Network(e.to_string());
     let mut data = Vec::new();
     let mut handle = Easy::new();
