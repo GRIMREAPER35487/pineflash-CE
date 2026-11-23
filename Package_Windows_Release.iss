@@ -7,7 +7,7 @@
 
 #define MyAppName "PineFlash CE"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.6.0"
+  #define MyAppVersion "0.7.0"
 #endif
 #define MyAppPublisher "GRIMREAPER35487"
 #define MyAppURL "https://github.com/GRIMREAPER35487/pineflash-CE"

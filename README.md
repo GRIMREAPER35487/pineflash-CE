@@ -36,7 +36,11 @@ Switch to **Boot logo** mode for a gallery of every logo from [IronOS-Meta](http
 
 ![Boot logo mode: a gallery of IronOS-Meta logos](docs/screenshots/boot-logos.png)
 
+### Custom firmware sources
+Click **Sources...** next to the Firmware list to add any GitHub repository that publishes IronOS-style releases, such as an IronOS fork (paste `owner/repo` or the repo's link). Its newest builds for your iron appear in the Firmware list under the repo's name, and are downloaded, backed up and verified just like official IronOS. A source's releases need a `Pinecilv2.zip` (or `Pinecil.zip`) asset, and `metadata.zip` for the language list.
+
 ### And also
+- The normal Windows Open dialog for choosing a firmware file or a backup to restore.
 - Stable IronOS releases by default, with a **Show pre-releases** switch for release candidates.
 - A connection status sidebar, a built-in guide to flashing mode, a progress bar and clear notifications.
 - Light and dark themes.
