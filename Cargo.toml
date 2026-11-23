@@ -1,6 +1,6 @@
 [package]
 name = "pineflash"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 build = "build.rs"
 description = "PineFlash CE: a community continuation of PineFlash, the IronOS flasher for Pinecil V1 and V2"

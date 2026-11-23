@@ -62,7 +62,8 @@ struct FlasherConfig {
     v2_serial_path: Option<String>,
     // connection_guide_image: Vec<ColorImage>,
     current_step: usize,
-    json_checked: bool,
+    /// The IronOS release list request running in the background, if any.
+    versions_rx: Option<std::sync::mpsc::Receiver<Result<(String, submodules::ghcache::Freshness), String>>>,
     metadata_path: PathBuf,
     /// A native Open dialog running on a background thread, and what the file is for.
     picker: Option<(submodules::main_panel::Pick, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
@@ -172,7 +173,7 @@ impl Default for FlasherConfig {
             prereleases: vec![],
             download_metadata: false,
             run_once_vers: true,
-            json_checked: false,
+            versions_rx: None,
             download: false,
             blisp_version: "".to_string(),
             download_versions: true,
@@ -257,76 +258,79 @@ impl eframe::App for Flasher {
         self.poll_picker();
 
         if self.config.download_versions {
-            let _ = std::fs::remove_file(self.config.metadata_path.clone());
-            self.config.download_versions = !self.config.download_versions;
+            self.config.download_versions = false;
             self.toasts
                 .info("Checking for firmware releases")
                 .set_duration(None)
                 .set_closable(false);
-
-            std::thread::spawn(|| {
-                let path: PathBuf = std::env::temp_dir().join("metadata.json");
-                let body = match download("https://api.github.com/repos/Ralim/IronOS/releases") {
-                    Ok(data) => String::from_utf8_lossy(&data).into_owned(),
-                    Err(DownloadError::Network(_)) => "No Internet".to_string(),
-                    // e.g. GitHub rate limit (403): keep the message so the UI can show it
-                    Err(e) => format!("{{\"error\": {:?}}}", e.to_string()),
-                };
-                // Write then rename, so the UI thread never reads a half-written file.
-                let tmp = path.with_extension("json.part");
-                if std::fs::write(&tmp, body).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(submodules::ghcache::get_json(
+                    "https://api.github.com/repos/Ralim/IronOS/releases",
+                    "ironos-releases",
+                ));
+            });
+            self.config.versions_rx = Some(rx);
+        }
+        let versions_reply = match &self.config.versions_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err("the request stopped".into())),
+            },
+            None => None,
+        };
+        if let Some(reply) = versions_reply {
+            use submodules::ghcache::Freshness;
+            self.config.versions_rx = None;
+            self.config.versions_checked = true;
+            self.toasts.dismiss_all_toasts();
+            let parsed = reply.and_then(|(json, fresh)| {
+                let (versions, pre) = parse_versions(&json, self.saved_config.show_prereleases);
+                if versions.is_empty() {
+                    Err("GitHub's release list had no releases in it".to_string())
+                } else {
+                    Ok((json, versions, pre, fresh))
                 }
             });
-        } else if !self.config.versions_checked
-            && self.config.metadata_path.exists()
-            && !std::fs::read_to_string(&self.config.metadata_path)
-                .unwrap_or_default()
-                .contains("No Internet")
-        {
-            self.toasts.dismiss_all_toasts();
-            self.toasts
-                .success("Firmware list updated")
-                .set_duration(Some(Duration::from_secs(5)))
-                .set_closable(false);
-            self.config
-                .logs
-                .push_str("PineFlash: Versions successfully fetched.\n");
-            self.config.json_checked = !self.config.json_checked;
-            let string = std::fs::read_to_string(&self.config.metadata_path).unwrap_or_default();
-            let (versions, pre) = parse_versions(&string, self.saved_config.show_prereleases);
-            if versions.is_empty() {
-                self.toasts.dismiss_all_toasts();
-                self.toasts
-                    .error("Could not reach GitHub\nOnline firmware is unavailable. You can still flash a file from this PC.")
-                    .set_duration(Some(Duration::from_secs(5)))
-                    .set_closable(false);
-                let detail: String = string.chars().take(200).collect();
-                self.config.logs.push_str(
-                    format!("PineFlash: Could not read the release list from GitHub: {}\n", detail).as_str(),
-                );
-                self.config.versions_checked = true;
-            } else {
-                self.config.vers = versions;
-                self.config.prereleases = pre;
-                self.config.versions_checked = true;
-                self.config.download_metadata = true;
+            match parsed {
+                Ok((json, versions, pre, fresh)) => {
+                    // refresh_versions() re-reads this when the pre-release switch changes.
+                    let _ = std::fs::write(&self.config.metadata_path, &json);
+                    self.config.vers = versions;
+                    self.config.prereleases = pre;
+                    self.config.download_metadata = true;
+                    match fresh {
+                        Freshness::Live | Freshness::Unchanged => {
+                            self.config.logs.push_str("PineFlash: Versions successfully fetched.\n");
+                            self.toasts
+                                .success("Firmware list updated")
+                                .set_duration(Some(Duration::from_secs(5)));
+                        }
+                        Freshness::Saved(why) => {
+                            self.config
+                                .logs
+                                .push_str(format!("PineFlash: Using the saved firmware list ({}).\n", why).as_str());
+                            self.toasts
+                                .warning(format!("Using the saved firmware list\n{}.", why))
+                                .set_duration(Some(Duration::from_secs(7)))
+                                .set_closable(true);
+                        }
+                    }
+                }
+                Err(why) => {
+                    self.config
+                        .logs
+                        .push_str(format!("PineFlash: Could not get the firmware list: {}\n", why).as_str());
+                    self.toasts
+                        .error(format!(
+                            "Could not get the firmware list\n{}. You can still flash a file from this PC.",
+                            why
+                        ))
+                        .set_duration(Some(Duration::from_secs(8)))
+                        .set_closable(true);
+                }
             }
-        } else if !self.config.versions_checked
-            && self.config.metadata_path.exists()
-            && std::fs::read_to_string(&self.config.metadata_path)
-                .unwrap_or_default()
-                .contains("No Internet")
-        {
-            self.toasts.dismiss_all_toasts();
-            self.toasts
-                .error("No internet connection\nOnline firmware is unavailable. You can still flash a file from this PC.")
-                .set_duration(Some(Duration::from_secs(5)))
-                .set_closable(false);
-            self.config
-                .logs
-                .push_str("PineFlash: No internet, could not fetch versions.\n");
-            self.config.versions_checked = true;
         }
 
         Flasher::render_header(self, ctx);

@@ -33,7 +33,9 @@ impl SourceRelease {
 pub struct SourcesState {
     /// Release list per repo, or the error from fetching it.
     pub releases: HashMap<String, Result<Vec<SourceRelease>, String>>,
-    pub pending: Vec<(String, Receiver<Result<Vec<SourceRelease>, String>>)>,
+    /// Repos whose list is the saved copy, and why GitHub couldn't be asked.
+    pub saved_note: HashMap<String, String>,
+    pub pending: Vec<(String, Receiver<Fetched>)>,
     pub window_open: bool,
     pub new_source: String,
 }
@@ -124,13 +126,24 @@ pub fn parse_releases(json: &str) -> Result<Vec<SourceRelease>, String> {
 }
 
 /// Fetch a repo's releases (runs on a background thread).
-pub fn fetch(repo: &str) -> Result<Vec<SourceRelease>, String> {
+/// The releases, plus a note when they come from the saved copy because GitHub couldn't be asked.
+pub type Fetched = Result<(Vec<SourceRelease>, Option<String>), String>;
+
+pub fn fetch(repo: &str) -> Fetched {
+    use super::ghcache::{get_json, Freshness};
     let url = format!("https://api.github.com/repos/{}/releases?per_page=30", repo);
-    let body = crate::download(&url).map_err(|e| match e {
-        crate::DownloadError::Http(404) => "repository not found (or it is private)".to_string(),
-        other => other.to_string(),
+    let (json, fresh) = get_json(&url, &format!("source-{}", repo)).map_err(|e| {
+        if e.starts_with("not found") {
+            "repository not found (or it is private)".to_string()
+        } else {
+            e
+        }
     })?;
-    parse_releases(&String::from_utf8_lossy(&body))
+    let note = match fresh {
+        Freshness::Saved(why) => Some(why),
+        _ => None,
+    };
+    Ok((parse_releases(&json)?, note))
 }
 
 /// The releases of `repo` to show for this iron: newest first, at most PER_SOURCE.
@@ -173,12 +186,23 @@ impl crate::Flasher {
             }
         });
         for (repo, result) in done {
-            match &result {
-                Ok(list) => self.config.logs.push_str(
-                    format!("PineFlash: Source {}: {} releases found.\n", repo, list.len()).as_str(),
-                ),
-                Err(e) => self.config.logs.push_str(format!("PineFlash: Source {}: {}\n", repo, e).as_str()),
-            }
+            self.config.sources.saved_note.remove(&repo);
+            let result = match result {
+                Ok((list, note)) => {
+                    let mut line = format!("PineFlash: Source {}: {} releases found", repo, list.len());
+                    if let Some(why) = note {
+                        line.push_str(&format!(" (saved list: {})", why));
+                        self.config.sources.saved_note.insert(repo.clone(), why);
+                    }
+                    line.push_str(".\n");
+                    self.config.logs.push_str(&line);
+                    Ok(list)
+                }
+                Err(e) => {
+                    self.config.logs.push_str(format!("PineFlash: Source {}: {}\n", repo, e).as_str());
+                    Err(e)
+                }
+            };
             self.config.sources.releases.insert(repo, result);
         }
     }
@@ -264,7 +288,11 @@ impl crate::Flasher {
                         match self.config.sources.releases.get(&repo) {
                             Some(Ok(_)) => {
                                 let n = releases_for(&self.config.sources, &repo, &int_name).len();
-                                if n == 0 {
+                                if self.config.sources.saved_note.contains_key(&repo) {
+                                    RichText::new(format!("{} build{} (saved list)", n, if n == 1 { "" } else { "s" }))
+                                        .size(12.5)
+                                        .color(super::main_panel::AMBER)
+                                } else if n == 0 {
                                     RichText::new("no builds for this iron").size(12.5).color(super::main_panel::AMBER)
                                 } else {
                                     RichText::new(format!("{} build{} for this iron", n, if n == 1 { "" } else { "s" }))
@@ -371,7 +399,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_fetch() {
-        let list = fetch(OFFICIAL).unwrap();
+        let (list, _) = fetch(OFFICIAL).unwrap();
         let state = SourcesState { releases: [(OFFICIAL.to_string(), Ok(list))].into(), ..Default::default() };
         let v2 = releases_for(&state, OFFICIAL, "Pinecilv2");
         println!("{:?}", v2.iter().map(|r| &r.tag).collect::<Vec<_>>());
